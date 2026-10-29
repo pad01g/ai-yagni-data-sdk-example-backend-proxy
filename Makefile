@@ -29,7 +29,7 @@ test: image ## テスト（MySQL のコンテナを試験用のスキーマで�
 	docker rm -f $(TESTDB) >/dev/null 2>&1 || true
 	docker run -d --rm --name $(TESTDB) --network $(NET) --tmpfs /var/lib/mysql \
 	  -e MYSQL_ROOT_PASSWORD=test -e MYSQL_DATABASE=shop -v $(CURDIR)/testdata:/docker-entrypoint-initdb.d:ro \
-	  mysql:8.4.6 >/dev/null
+	  mysql:8.4.6 --character-set-server=utf8mb4 --collation-server=utf8mb4_0900_bin >/dev/null
 	docker run --rm $(CACHE) -v $(CURDIR):/work -w /work --network $(NET) \
 	  -e DATABASE_URL=mysql://root:test@$(TESTDB):3306/shop $(DEV) cargo test --locked; \
 	  s=$$?; docker rm -f $(TESTDB) >/dev/null; docker network rm $(NET) >/dev/null; exit $$s

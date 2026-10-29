@@ -58,21 +58,32 @@ fn check_len(name: &str, v: &str, min: usize, max: usize) -> Result<(), Status> 
     Ok(())
 }
 
+/// 文字列の列。照合順序が *_bin の列は、sqlx に VARBINARY として報告されるので、バイト列からも読む。
+fn text(r: &MySqlRow, column: &str) -> Result<String, sqlx::Error> {
+    match r.try_get::<String, _>(column) {
+        Ok(s) => Ok(s),
+        Err(_) => {
+            let bytes: Vec<u8> = r.try_get(column)?;
+            String::from_utf8(bytes).map_err(|e| sqlx::Error::Decode(Box::new(e)))
+        }
+    }
+}
+
 fn customer(r: &MySqlRow) -> Result<Customer, sqlx::Error> {
     Ok(Customer {
         id: r.try_get("id")?,
-        email: r.try_get("email")?,
-        full_name: r.try_get("full_name")?,
-        address: r.try_get("address")?,
+        email: text(r, "email")?,
+        full_name: text(r, "full_name")?,
+        address: text(r, "address")?,
     })
 }
 
 fn product(r: &MySqlRow) -> Result<Product, sqlx::Error> {
     Ok(Product {
         id: r.try_get("id")?,
-        code: r.try_get("code")?,
-        name: r.try_get("name")?,
-        description: r.try_get("description")?,
+        code: text(r, "code")?,
+        name: text(r, "name")?,
+        description: text(r, "description")?,
         price: r.try_get("price")?,
         stock: r.try_get("stock")?,
     })
@@ -83,9 +94,9 @@ fn order(r: &MySqlRow) -> Result<Order, sqlx::Error> {
         id: r.try_get("id")?,
         customer_id: r.try_get("customer_id")?,
         total: r.try_get("total")?,
-        status: r.try_get("status")?,
-        created_at: r.try_get("created_at")?,
-        payment_ref: r.try_get("payment_ref")?,
+        status: text(r, "status")?,
+        created_at: text(r, "created_at")?,
+        payment_ref: text(r, "payment_ref")?,
         items: Vec::new(),
     })
 }
@@ -94,7 +105,7 @@ fn item(r: &MySqlRow) -> Result<OrderItem, sqlx::Error> {
     Ok(OrderItem {
         line_no: u32::from(r.try_get::<u16, _>("line_no")?),
         product_id: r.try_get("product_id")?,
-        product_name: r.try_get("product_name")?,
+        product_name: text(r, "product_name")?,
         quantity: r.try_get("quantity")?,
         unit_price: r.try_get("unit_price")?,
     })
@@ -159,7 +170,7 @@ impl ShopService {
                 .await
                 .map_err(internal)?
                 .ok_or_else(|| Status::not_found(format!("no product {id}")))?;
-            let name: String = row.try_get("name").map_err(internal)?;
+            let name = text(&row, "name").map_err(internal)?;
             let stock: i32 = row.try_get("stock").map_err(internal)?;
             if proxy_verified::reserve(u32::try_from(stock).unwrap_or(0), want).is_none() {
                 return Err(Status::failed_precondition(format!("out of stock: {name}")));
@@ -280,7 +291,7 @@ impl Shop for ShopService {
             .ok_or_else(|| Status::not_found("no such customer"))?;
         Ok(Response::new(Credential {
             customer_id: row.try_get("id").map_err(internal)?,
-            password_hash: row.try_get("password_hash").map_err(internal)?,
+            password_hash: text(&row, "password_hash").map_err(internal)?,
         }))
     }
 
