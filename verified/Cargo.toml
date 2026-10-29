@@ -1,0 +1,17 @@
+[package]
+name = "proxy-verified"
+description = "backend-proxy のうち、Verus で証明する純粋な部分（数量の検査・在庫の引き当て・注文の合計）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vstd.workspace = true
+
+[package.metadata.verus]
+verify = true
+
+[lints]
+workspace = true

@@ -1,0 +1,119 @@
+// backend-proxy が受け付ける操作の全部。
+//
+// backend-rust はデータベースに直接つながらず、この操作だけを呼ぶ。どの操作も、proxy の中の固定クエリ
+// （queries/*.sql）だけを使う。SQL の文字列や、表・列の名前を受け取る操作はない。
+// backend-rust が乗っ取られても、ここにない読み書きはできない。
+syntax = "proto3";
+
+package shop.v1;
+
+service Shop {
+  // 顧客を登録する。メールが使われていれば ALREADY_EXISTS。
+  rpc CreateCustomer(CreateCustomerRequest) returns (Customer);
+  rpc GetCustomer(GetCustomerRequest) returns (Customer);
+  // ログインのための照合材料（パスワードのハッシュ）。照合は backend-rust がする。なければ NOT_FOUND。
+  rpc FindCredential(FindCredentialRequest) returns (Credential);
+
+  rpc ListProducts(ListProductsRequest) returns (ProductList);
+  rpc GetProduct(GetProductRequest) returns (Product);
+
+  // 注文する。在庫を引き当て、決済サービスに請求し、注文を書く（1 つのトランザクション）。
+  // 同じ (customer_id, request_key) には同じ注文を返す。在庫不足と決済の拒否は FAILED_PRECONDITION。
+  rpc PlaceOrder(PlaceOrderRequest) returns (Order);
+  rpc ListOrders(ListOrdersRequest) returns (OrderList);
+  // 顧客自身の注文だけを返す。なければ NOT_FOUND。
+  rpc GetOrder(GetOrderRequest) returns (Order);
+}
+
+message CreateCustomerRequest {
+  string email = 1;
+  string password_hash = 2;
+  string full_name = 3;
+  string address = 4;
+}
+
+message GetCustomerRequest {
+  uint64 id = 1;
+}
+
+message Customer {
+  uint64 id = 1;
+  string email = 2;
+  string full_name = 3;
+  string address = 4;
+}
+
+message FindCredentialRequest {
+  string email = 1;
+}
+
+message Credential {
+  uint64 customer_id = 1;
+  string password_hash = 2;
+}
+
+message ListProductsRequest {}
+
+message GetProductRequest {
+  uint64 id = 1;
+}
+
+message Product {
+  uint64 id = 1;
+  string code = 2;
+  string name = 3;
+  string description = 4;
+  // 円（最小単位）
+  uint32 price = 5;
+  int32 stock = 6;
+}
+
+message ProductList {
+  repeated Product products = 1;
+}
+
+message OrderLine {
+  uint64 product_id = 1;
+  uint32 quantity = 2;
+}
+
+message PlaceOrderRequest {
+  uint64 customer_id = 1;
+  // 依頼の冪等キー（UUID の文字列）
+  string request_key = 2;
+  repeated OrderLine lines = 3;
+  // 決済サービスのカードのトークン
+  string card_token = 4;
+}
+
+message OrderItem {
+  uint32 line_no = 1;
+  uint64 product_id = 2;
+  string product_name = 3;
+  uint32 quantity = 4;
+  uint32 unit_price = 5;
+}
+
+message Order {
+  uint64 id = 1;
+  uint64 customer_id = 2;
+  uint64 total = 3;
+  string status = 4;
+  // UTC（YYYY-MM-DD HH:MM:SS.ffffff）
+  string created_at = 5;
+  string payment_ref = 6;
+  repeated OrderItem items = 7;
+}
+
+message ListOrdersRequest {
+  uint64 customer_id = 1;
+}
+
+message OrderList {
+  repeated Order orders = 1;
+}
+
+message GetOrderRequest {
+  uint64 customer_id = 1;
+  uint64 order_id = 2;
+}

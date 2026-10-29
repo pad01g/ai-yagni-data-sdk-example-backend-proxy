@@ -1,0 +1,20 @@
+[package]
+name = "shop-proxy-api"
+description = "backend-proxy の gRPC の操作の定義（proto）と、生成したクライアントとサーバー"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+prost.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[build-dependencies]
+protoc-bin-vendored = "3"
+tonic-prost-build = "0.14"
+
+[lints]
+workspace = true

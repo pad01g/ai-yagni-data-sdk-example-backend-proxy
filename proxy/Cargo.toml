@@ -1,0 +1,25 @@
+[package]
+name = "shop-proxy"
+description = "backend-rust のための、固定クエリだけを持つ SQL のマイクロサービス（gRPC）。決済サービスへの接続も持つ"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+shop-proxy-api = { path = "../api" }
+proxy-verified = { path = "../verified" }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "mysql"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tonic.workspace = true
+
+[dev-dependencies]
+axum = "0.8"
+serde_json = "1"
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[lints]
+workspace = true
