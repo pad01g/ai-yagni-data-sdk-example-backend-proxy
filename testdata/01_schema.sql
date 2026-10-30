@@ -45,21 +45,29 @@ CREATE TABLE products (
 --   pending → paid（決済が通った）→ shipped / cancelled（SE の作業）
 --   pending → declined（決済が拒否された。引き当てた在庫は戻す）
 -- (customer_id, request_key) は注文の依頼の冪等キー（同じ依頼を 2 度送っても注文は 1 つ）。
--- payment_ref は決済サービスの決済 ID。決済が通った注文は必ず持ち、1 つの決済は 1 つの注文にだけ使う。
+-- payment_key は決済サービスへの冪等キー（proxy が作る乱数の UUID）。注文の ID を使わないのは、DB を作り直して
+-- ID が繰り返されても、前の決済と取り違えないため。決着しない注文を後から決済サービスと突き合わせるのにも使う。
+-- payment_ref は決済サービスの決済 ID。決済が通った注文だけが持ち、1 つの決済は 1 つの注文にだけ使う。
+-- orders_customer_recent は、顧客の新しい注文から読む proxy の固定クエリのため。
 CREATE TABLE orders (
   id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   customer_id BIGINT UNSIGNED NOT NULL,
   request_key CHAR(36)        NOT NULL,
   total       BIGINT UNSIGNED NOT NULL,
+  payment_key CHAR(36)        NULL,
   payment_ref VARCHAR(64)     NULL,
   status      VARCHAR(16)     NOT NULL DEFAULT 'pending',
   created_at  DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   PRIMARY KEY (id),
   UNIQUE KEY orders_request (customer_id, request_key),
   UNIQUE KEY orders_payment (payment_ref),
+  UNIQUE KEY orders_payment_key (payment_key),
+  KEY orders_customer_recent (customer_id, id),
   CONSTRAINT orders_customer FOREIGN KEY (customer_id) REFERENCES customers (id),
   CONSTRAINT orders_status CHECK (status IN ('pending', 'paid', 'declined', 'shipped', 'cancelled')),
-  CONSTRAINT orders_settled_have_payment CHECK (status IN ('pending', 'declined') OR payment_ref IS NOT NULL)
+  CONSTRAINT orders_settled_have_payment CHECK (status IN ('pending', 'declined') OR payment_ref IS NOT NULL),
+  CONSTRAINT orders_unsettled_have_no_payment CHECK (status NOT IN ('pending', 'declined') OR payment_ref IS NULL),
+  CONSTRAINT orders_pending_have_key CHECK (status <> 'pending' OR payment_key IS NOT NULL)
 ) DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_0900_bin;
 
 -- 注文の明細。単価は注文した時点の価格の写し（商品の価格が後で変わっても注文は変わらない）。

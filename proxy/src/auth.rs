@@ -57,9 +57,17 @@ impl Passwords {
     }
 
     async fn run<T: Send + 'static>(&self, f: impl FnOnce() -> T + Send + 'static) -> Result<T, Busy> {
-        let _permit =
-            tokio::time::timeout(self.wait, self.slots.acquire()).await.map_err(|_| Busy)?.map_err(|_| Busy)?;
-        tokio::task::spawn_blocking(f).await.map_err(|_| Busy)
+        let permit = tokio::time::timeout(self.wait, self.slots.clone().acquire_owned())
+            .await
+            .map_err(|_| Busy)?
+            .map_err(|_| Busy)?;
+        // 枠は計算が終わるまで持つ（呼んだ側が待つのをやめても、計算は止まらないので）
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            f()
+        })
+        .await
+        .map_err(|_| Busy)
     }
 
     pub async fn hash(&self, password: String) -> Result<String, Busy> {

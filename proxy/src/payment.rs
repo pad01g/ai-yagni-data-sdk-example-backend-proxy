@@ -12,6 +12,13 @@ struct ChargeRequest<'a> {
 }
 
 #[derive(Deserialize)]
+struct FoundCharge {
+    id: String,
+    status: String,
+    reason: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct ChargeResponse {
     id: Option<String>,
     status: Option<String>,
@@ -79,6 +86,31 @@ impl PaymentClient {
             (409, _, _) => Err(PaymentError::Conflict),
             (400, _, _) => Err(PaymentError::Invalid(b.error.unwrap_or_default())),
             _ => Err(PaymentError::Unavailable(format!("payment answered {status}: {}", b.error.unwrap_or_default()))),
+        }
+    }
+}
+
+impl PaymentClient {
+    /// 冪等キーで決済を探す。その冪等キーで請求が届いていなければ None。
+    pub async fn find(&self, key: &str) -> Result<Option<Charge>, PaymentError> {
+        let r = self
+            .http
+            .get(format!("{}/charges", self.base))
+            .query(&[("idempotency_key", key)])
+            .send()
+            .await
+            .map_err(|e| PaymentError::Unavailable(e.to_string()))?;
+        match r.status().as_u16() {
+            404 => Ok(None),
+            200 => {
+                let c: FoundCharge = r.json().await.map_err(|e| PaymentError::Unavailable(e.to_string()))?;
+                Ok(Some(if c.status == "succeeded" {
+                    Charge::Succeeded { id: c.id }
+                } else {
+                    Charge::Declined { reason: c.reason.unwrap_or_default() }
+                }))
+            }
+            s => Err(PaymentError::Unavailable(format!("payment answered {s}"))),
         }
     }
 }

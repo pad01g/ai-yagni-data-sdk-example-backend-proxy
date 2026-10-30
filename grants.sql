@@ -10,7 +10,7 @@ GRANT SELECT ON shop.products TO 'proxy'@'%';
 GRANT UPDATE (stock) ON shop.products TO 'proxy'@'%';
 
 GRANT SELECT ON shop.orders TO 'proxy'@'%';
-GRANT INSERT (customer_id, request_key, total, status) ON shop.orders TO 'proxy'@'%';
+GRANT INSERT (customer_id, request_key, total, status, payment_key) ON shop.orders TO 'proxy'@'%';
 GRANT UPDATE (status, payment_ref) ON shop.orders TO 'proxy'@'%';
 
 GRANT SELECT, INSERT ON shop.order_items TO 'proxy'@'%';

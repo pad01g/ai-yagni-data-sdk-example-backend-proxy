@@ -89,8 +89,23 @@ async fn charge(
     (status, Json(answer))
 }
 
+#[derive(serde::Deserialize)]
+struct ByKey {
+    idempotency_key: String,
+}
+
+async fn lookup(
+    State(f): State<FakePayment>,
+    axum::extract::Query(q): axum::extract::Query<ByKey>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match f.charges.lock().unwrap().get(&q.idempotency_key) {
+        Some((_, _, answer)) => (StatusCode::OK, Json(answer.clone())),
+        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "no such charge"}))),
+    }
+}
+
 async fn fake_payment(f: FakePayment) -> SocketAddr {
-    let app = axum::Router::new().route("/charges", axum::routing::post(charge)).with_state(f);
+    let app = axum::Router::new().route("/charges", axum::routing::post(charge).get(lookup)).with_state(f);
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
@@ -100,6 +115,7 @@ async fn fake_payment(f: FakePayment) -> SocketAddr {
 struct T {
     c: ShopClient<Channel>,
     payment: FakePayment,
+    service: ShopService,
 }
 
 async fn start() -> T {
@@ -122,14 +138,15 @@ async fn start() -> T {
     );
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
+    let served = service.clone();
     tokio::spawn(async move {
         tonic::transport::Server::builder()
-            .add_service(ShopServer::new(service))
+            .add_service(ShopServer::new(served))
             .serve_with_incoming(TcpListenerStream::new(l))
             .await
             .unwrap()
     });
-    T { c: ShopClient::connect(format!("http://{addr}")).await.unwrap(), payment }
+    T { c: ShopClient::connect(format!("http://{addr}")).await.unwrap(), payment, service }
 }
 
 fn email(name: &str) -> String {
@@ -252,7 +269,7 @@ async fn products_are_listed() {
 
 #[tokio::test]
 async fn an_order_takes_prices_from_the_database_and_is_idempotent() {
-    let T { mut c, payment } = start().await;
+    let T { mut c, payment, .. } = start().await;
     let token = sign_up(&mut c, "idem").await;
     let before = stock(&mut c, 10).await;
     let req = order(&token, key(1), &[(10, 3)], "tok_visa");
@@ -309,7 +326,7 @@ async fn out_of_stock_writes_nothing_and_a_declined_payment_returns_the_stock() 
 
 #[tokio::test]
 async fn an_unreachable_payment_leaves_the_order_pending_until_the_request_is_retried() {
-    let T { mut c, payment } = start().await;
+    let T { mut c, payment, .. } = start().await;
     let token = sign_up(&mut c, "pending").await;
     let before = stock(&mut c, 13).await;
     payment.set(DOWN);
@@ -327,7 +344,7 @@ async fn an_unreachable_payment_leaves_the_order_pending_until_the_request_is_re
 
 #[tokio::test]
 async fn a_lost_answer_is_settled_without_charging_twice() {
-    let T { mut c, payment } = start().await;
+    let T { mut c, payment, .. } = start().await;
     let token = sign_up(&mut c, "lost").await;
     payment.set(LOSES_ANSWERS);
     let req = order(&token, key(9), &[(1, 1)], "tok_visa");
@@ -343,7 +360,7 @@ async fn a_lost_answer_is_settled_without_charging_twice() {
 
 #[tokio::test]
 async fn the_same_request_sent_twice_at_once_makes_one_order() {
-    let T { mut c, payment } = start().await;
+    let T { mut c, payment, .. } = start().await;
     let token = sign_up(&mut c, "twice").await;
     let before = stock(&mut c, 14).await;
     let req = order(&token, key(10), &[(14, 4)], "tok_visa");
@@ -389,4 +406,48 @@ async fn customers_see_only_their_own_orders() {
     assert_eq!(e.code(), Code::NotFound);
     assert!(orders(&mut c, &eve).await.is_empty());
     assert_eq!(c.get_order(GetOrderRequest { token: alice, order_id: o.id }).await.unwrap().into_inner(), o);
+}
+
+#[tokio::test]
+async fn an_old_token_cannot_end_newer_sessions() {
+    let T { mut c, .. } = start().await;
+    let old = sign_up(&mut c, "stale-token").await;
+    c.log_out(LogOutRequest { token: old.clone() }).await.unwrap();
+    let new = c
+        .log_in(LogInRequest { email: email("stale-token"), password: "password".to_owned() })
+        .await
+        .unwrap()
+        .into_inner()
+        .token;
+    // ログアウト済みのトークンでのログアウトは何もしない
+    c.log_out(LogOutRequest { token: old }).await.unwrap();
+    assert!(c.me(MeRequest { token: new }).await.is_ok());
+}
+
+#[tokio::test]
+async fn repeated_wrong_passwords_lock_the_email_for_a_while() {
+    let T { mut c, .. } = start().await;
+    sign_up(&mut c, "throttled").await;
+    let attempt = |password: &str| LogInRequest { email: email("throttled"), password: password.to_owned() };
+    for _ in 0..10 {
+        assert_eq!(c.log_in(attempt("wrong password")).await.unwrap_err().code(), Code::Unauthenticated);
+    }
+    let e = c.log_in(attempt("password")).await.unwrap_err();
+    assert_eq!((e.code(), e.message()), (Code::ResourceExhausted, "too many attempts"));
+}
+
+#[tokio::test]
+async fn stale_pending_orders_are_reconciled_with_the_payment_service() {
+    let T { mut c, payment, service } = start().await;
+    // 1001 の請求は決済サービスに届いていた（答えが失われた）。1002 は届いていない
+    payment.charges.lock().unwrap().insert(
+        "11111111-1111-4111-8111-111111111001".to_owned(),
+        (serde_json::Value::Null, StatusCode::CREATED, serde_json::json!({"id": "ch_stale", "status": "succeeded"})),
+    );
+    let before = stock(&mut c, 16).await;
+    // 1 時間より古いものだけ（ほかのテストの新しい pending の注文には触らない）
+    assert_eq!(service.reconcile(3600).await.unwrap(), 2);
+    assert_eq!(stock(&mut c, 16).await, before + 2, "the order without a charge returns its stock");
+    assert_eq!(service.reconcile(3600).await.unwrap(), 0, "nothing is left");
+    assert_eq!(payment.calls(), 0, "reconciling never charges");
 }

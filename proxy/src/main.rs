@@ -4,6 +4,8 @@
 //! - `PAYMENT_URL`: 決済サービス（`http://payment:8080`）。
 //! - `SESSION_SECRET`: セッションの署名の鍵（32 バイト以上。なければ起動しない）。持つのは proxy だけ。
 //! - `SESSION_TTL`: セッションの有効な秒数（既定 86400 = 1 日）。
+//! - `RECONCILE_AFTER`: 決着しないまま何秒たった pending の注文を、決済サービスと突き合わせて片付けるか
+//!   （既定 600。1 分ごとに確かめる）。
 //! - `LISTEN`: gRPC で待つ場所（既定 `0.0.0.0:50051`）。
 use std::time::Duration;
 
@@ -52,6 +54,20 @@ async fn main() {
     };
     let payment = PaymentClient::new(env("PAYMENT_URL"), Duration::from_secs(5));
     let service = ShopService::new(pool, payment, sessions, passwords);
+    let after: u64 = std::env::var("RECONCILE_AFTER")
+        .map_or(600, |v| v.parse().unwrap_or_else(|e| panic!("bad RECONCILE_AFTER: {e}")));
+    let reconciler = service.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            tick.tick().await;
+            match reconciler.reconcile(after).await {
+                Ok(0) => {}
+                Ok(n) => eprintln!("proxy: reconciled {n} pending orders"),
+                Err(e) => eprintln!("proxy: reconcile failed: {e}"),
+            }
+        }
+    });
     eprintln!("proxy: listening on {listen}");
     tonic::transport::Server::builder()
         .timeout(Duration::from_secs(15))

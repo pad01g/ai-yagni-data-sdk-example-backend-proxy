@@ -32,7 +32,7 @@ frontend ──HTTP──▶ backend-rust ──gRPC──▶ backend-proxy ─�
 |---|---|
 | `SignUp` | `customer_insert` |
 | `LogIn` | `credential_by_email`, `customer_by_id` |
-| `LogOut` | `customer_end_sessions` |
+| `LogOut` | `customer_end_sessions`（今の世代のトークンでだけ上げる） |
 | `Me` | `customer_session`, `customer_by_id` |
 | `ListProducts` | `products_all` |
 | `PlaceOrder` | 下を見てください |
@@ -51,6 +51,10 @@ frontend ──HTTP──▶ backend-rust ──gRPC──▶ backend-proxy ─�
   - 登録のないメールでも、照合と同じだけ argon2 を計算します。応答時間で登録の有無が漏れないようにするためです。
   - argon2 を同時に走らせる数は CPU の数までです。空きが 2 秒で出なければ `UNAVAILABLE "busy"` を返します。
 - **メール**: 小文字にそろえて保存し、照合します。
+- **回数の制限**: proxy のメモリで数えます。nginx の送り元の IP ごとの制限に加えるもので、IP を替えながらの総当たりや、注文の連打を遅くします。
+  - 同じメールへのログインの失敗が 15 分に 10 回を超えると、しばらく照合せずに `RESOURCE_EXHAUSTED "too many attempts"` を返します。
+  - 注文の依頼は、顧客ごとに 10 分に 30 回までです。
+- **古いトークン**: ログアウト済みの古いトークンでログアウトしても、新しいセッションは終わりません。
 
 ### 注文（`PlaceOrder`）
 
@@ -61,10 +65,14 @@ frontend ──HTTP──▶ backend-rust ──gRPC──▶ backend-proxy ─�
    2. 同じ商品の明細を足し合わせて在庫を引き当てます（`reserve`、`product_set_stock`）。
    3. DB の価格から合計を決めます（`order_total`）。
    4. 注文を `pending` で書きます（`order_insert`、`order_item_insert`）。
-2. **請求**（トランザクションの外）: 決済サービスに請求します。冪等キーは `order-<注文 ID>` です。
+2. **請求**（トランザクションの外）: 決済サービスに請求します。
+   - 冪等キーは、注文ごとに proxy が作る乱数の UUID（`orders.payment_key`）です。
+   - 注文の ID を使わないのは、DB を作り直して ID が繰り返されても、前の決済と取り違えないためです。
 3. **決着**
    - 決済が通れば `paid` にします（`order_mark_paid`）。
-   - 拒否なら、1 つのトランザクションで `declined` にし、在庫を戻します（`order_mark_declined`、`product_restock_order`）。
+   - 拒否なら、1 つのトランザクションで `declined` にし、在庫を戻します（`product_lock_order`、`order_mark_declined`、`product_restock_order`）。
+     - 商品の行は、引き当てと同じ ID の順に固定します（デッドロックを避ける）。
+   - デッドロックや行の固定の待ちの時間切れなら、その場で 3 度までやり直します。
 
 この形には、次の性質があります。
 
@@ -76,7 +84,11 @@ frontend ──HTTP──▶ backend-rust ──gRPC──▶ backend-proxy ─�
   - 同じ依頼をやり直すと、同じ冪等キーで請求して決着させます。答えが途中で失われた請求も、二重には請求しません。
   - 前と違うカードでやり直すと、`FAILED_PRECONDITION "payment conflict"` です。
 - **中断されないこと**: 呼んだ側が待つのをやめても（切断・時間切れ）、決済と決着は最後まで進めます。
-- **SE の作業**: 利用者がやり直さないまま残った `pending` の注文は、SE が決済サービスの記録と突き合わせて片付けます。
+- **突き合わせ**: 決着しないまま古くなった `pending` の注文（既定 10 分、`RECONCILE_AFTER`）は、proxy が 1 分ごとに片付けます（`orders_pending_stale`）。
+  - 決済サービスの記録を冪等キーで探し（`GET /charges?idempotency_key=`）、決済が通っていれば `paid` にします。
+  - 拒否されていたか、記録がなければ `declined` にして在庫を戻します。
+  - 利用者は結果を受け取っていないので、突き合わせで新たに請求することはしません。
+  - 突き合わせの直前に利用者がやり直した場合だけは、決済が通っても注文が `declined` になりえます。待つ時間を十分に長くして、その窓を小さくしています。
 
 ### 失敗
 
@@ -121,13 +133,14 @@ make verify   # Verus（amd64 のイメージ）
 | `PAYMENT_URL` | `http://payment:8080`（1 回の請求を待つのは 5 秒まで） |
 | `SESSION_SECRET` | セッションの署名の鍵。32 バイト以上でなければ起動しない |
 | `SESSION_TTL` | セッションの有効な秒数（既定 86400） |
+| `RECONCILE_AFTER` | 何秒たった `pending` の注文を突き合わせるか（既定 600） |
 | `LISTEN` | 既定 `0.0.0.0:50051` |
 
 ## 使い方（Cargo、クライアント）
 
 ```toml
 [dependencies]
-shop-proxy-api = { git = "https://github.com/pad01g/ai-yagni-data-sdk-example-backend-proxy", tag = "v0.2.0" }
+shop-proxy-api = { git = "https://github.com/pad01g/ai-yagni-data-sdk-example-backend-proxy", tag = "v0.3.0" }
 ```
 
 ## ライセンス

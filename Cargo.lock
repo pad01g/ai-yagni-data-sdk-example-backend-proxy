@@ -1205,7 +1205,7 @@ checksum = "263a3f48f01e7309e857138bd47f785585b4a005e8e56c6d2824ce91195999c3"
 
 [[package]]
 name = "proxy-verified"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "vstd",
 ]
@@ -1495,7 +1495,7 @@ dependencies = [
 
 [[package]]
 name = "shop-proxy"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "argon2",
  "axum",
@@ -1515,7 +1515,7 @@ dependencies = [
 
 [[package]]
 name = "shop-proxy-api"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "prost",
  "protoc-bin-vendored",

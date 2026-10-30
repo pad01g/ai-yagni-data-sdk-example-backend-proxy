@@ -12,11 +12,14 @@
 pub mod auth;
 pub mod payment;
 pub mod queries;
+pub mod throttle;
 
 use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use argon2::password_hash::rand_core::{OsRng, RngCore};
 
 use shop_proxy_api::shop_server::Shop;
 use shop_proxy_api::{
@@ -29,6 +32,7 @@ use tonic::{Request, Response, Status};
 
 use crate::auth::{Busy, Claim, Passwords, Sessions};
 use crate::payment::{Charge, PaymentClient, PaymentError, public_reason};
+use crate::throttle::Throttle;
 
 /// 1 つの注文の明細の行数の上限。
 pub const MAX_LINES: usize = 20;
@@ -40,6 +44,10 @@ struct Inner {
     payment: PaymentClient,
     sessions: Sessions,
     passwords: Passwords,
+    /// メールごとのログインの失敗（15 分に 10 回まで）
+    logins: Throttle,
+    /// 顧客ごとの注文の依頼（10 分に 30 回まで）
+    orders: Throttle,
 }
 
 #[derive(Clone)]
@@ -47,7 +55,14 @@ pub struct ShopService(Arc<Inner>);
 
 impl ShopService {
     pub fn new(pool: MySqlPool, payment: PaymentClient, sessions: Sessions, passwords: Passwords) -> Self {
-        Self(Arc::new(Inner { pool, payment, sessions, passwords }))
+        Self(Arc::new(Inner {
+            pool,
+            payment,
+            sessions,
+            passwords,
+            logins: Throttle::new(10, Duration::from_secs(15 * 60)),
+            orders: Throttle::new(30, Duration::from_secs(10 * 60)),
+        }))
     }
 
     fn pool(&self) -> &MySqlPool {
@@ -77,6 +92,25 @@ fn unauthenticated() -> Status {
 
 fn busy(_: Busy) -> Status {
     Status::unavailable("busy")
+}
+
+fn too_many() -> Status {
+    Status::resource_exhausted("too many attempts")
+}
+
+/// やり直せば通りうる DB の失敗（行の固定の待ちの時間切れ、デッドロック）。
+fn transient(e: &sqlx::Error) -> bool {
+    matches!(mysql_error(e), Some(1205 | 1213))
+}
+
+/// 決済サービスへの冪等キー（乱数の UUID）。注文の ID と違い、DB を作り直しても前のものと重ならない。
+fn new_payment_key() -> String {
+    let mut b = [0u8; 16];
+    OsRng.fill_bytes(&mut b);
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
 }
 
 /// MySQL のエラー番号。
@@ -174,6 +208,16 @@ struct Placed {
     id: u64,
     total: u64,
     status: String,
+    /// 決済サービスへの冪等キー（pending の注文は必ず持つ）
+    payment_key: Option<String>,
+}
+
+fn placed(row: &MySqlRow) -> Result<Placed, sqlx::Error> {
+    let payment_key = match row.try_get::<Option<String>, _>("payment_key") {
+        Ok(k) => k,
+        Err(_) => row.try_get::<Option<Vec<u8>>, _>("payment_key")?.map(|b| String::from_utf8_lossy(&b).into_owned()),
+    };
+    Ok(Placed { id: row.try_get("id")?, total: row.try_get("total")?, status: text(row, "status")?, payment_key })
 }
 
 // ---------------------------------------------------------------------------------------- 操作の中身
@@ -234,11 +278,7 @@ impl ShopService {
         else {
             return Ok(None);
         };
-        let placed = Placed {
-            id: row.try_get("id").map_err(db)?,
-            total: row.try_get("total").map_err(db)?,
-            status: text(&row, "status").map_err(db)?,
-        };
+        let placed = placed(&row).map_err(db)?;
         let rows =
             sqlx::query(queries::ORDER_ITEMS_BY_ORDER).bind(placed.id).fetch_all(self.pool()).await.map_err(db)?;
         let mut before = Vec::with_capacity(rows.len());
@@ -287,10 +327,12 @@ impl ShopService {
         let quantities: Vec<u32> = req.lines.iter().map(|l| l.quantity).collect();
         let total = proxy_verified::order_total(&line_prices, &quantities).ok_or_else(|| invalid("quantity"))?;
 
+        let payment_key = new_payment_key();
         let inserted = sqlx::query(queries::ORDER_INSERT)
             .bind(customer_id)
             .bind(&req.request_key)
             .bind(total)
+            .bind(&payment_key)
             .execute(&mut *tx)
             .await;
         let order_id = match inserted {
@@ -328,35 +370,59 @@ impl ShopService {
             }
         }
         tx.commit().await.map_err(db)?;
-        Ok(Placed { id: order_id, total, status: "pending".to_owned() })
+        Ok(Placed { id: order_id, total, status: "pending".to_owned(), payment_key: Some(payment_key) })
     }
 
-    /// 決済の拒否: 注文を declined にし、引き当てた在庫を戻す（1 つのトランザクション）。
+    /// 決済の拒否（または決済がなかった）: 注文を declined にし、引き当てた在庫を戻す（1 つのトランザクション）。
+    /// 商品の行は引き当てと同じ ID の順に固定する。デッドロックなどはその場で 3 度までやり直す。
     async fn decline(&self, order_id: u64) -> Result<(), Status> {
-        let mut tx = self.pool().begin().await.map_err(db)?;
-        let r = sqlx::query(queries::ORDER_MARK_DECLINED).bind(order_id).execute(&mut *tx).await.map_err(db)?;
-        if r.rows_affected() == 1 {
-            sqlx::query(queries::PRODUCT_RESTOCK_ORDER).bind(order_id).execute(&mut *tx).await.map_err(db)?;
+        let once = || async {
+            let mut tx = self.pool().begin().await?;
+            sqlx::query(queries::PRODUCT_LOCK_ORDER).bind(order_id).fetch_all(&mut *tx).await?;
+            let r = sqlx::query(queries::ORDER_MARK_DECLINED).bind(order_id).execute(&mut *tx).await?;
+            if r.rows_affected() == 1 {
+                sqlx::query(queries::PRODUCT_RESTOCK_ORDER).bind(order_id).execute(&mut *tx).await?;
+            }
+            tx.commit().await
+        };
+        let mut attempt = 0;
+        loop {
+            match once().await {
+                Err(e) if transient(&e) && attempt < 2 => attempt += 1,
+                r => return r.map_err(db),
+            }
         }
-        tx.commit().await.map_err(db)
+    }
+
+    /// 決済が通った注文を paid にする。pending でなければ何もしない（false）。やり直しは decline と同じ。
+    async fn mark_paid(&self, order_id: u64, charge: &str) -> Result<bool, Status> {
+        let mut attempt = 0;
+        loop {
+            match sqlx::query(queries::ORDER_MARK_PAID).bind(charge).bind(order_id).execute(self.pool()).await {
+                Ok(done) => return Ok(done.rows_affected() == 1),
+                Err(e) if transient(&e) && attempt < 2 => attempt += 1,
+                Err(e) if duplicate_on(&e, "orders_payment") => {
+                    return Err(internal(
+                        "a charge is already used by another order",
+                        format!("{charge} for order {order_id}"),
+                    ));
+                }
+                Err(e) => return Err(db(e)),
+            }
+        }
     }
 
     /// pending の注文を、決済サービスに請求して決着させる。トランザクションの外で請求する。
-    /// 冪等キーは注文の ID なので、やり直しても二重に請求しない。
+    /// 冪等キーは注文ごとの payment_key なので、やり直しても二重に請求しない。
     async fn settle(&self, customer_id: u64, p: &Placed, card_token: &str) -> Result<u64, Status> {
-        let key = format!("order-{}", p.id);
-        match self.0.payment.charge(&key, p.total, CURRENCY, card_token).await {
+        let key = p.payment_key.as_deref().ok_or_else(|| internal("a pending order without a payment key", p.id))?;
+        match self.0.payment.charge(key, p.total, CURRENCY, card_token).await {
             Ok(Charge::Succeeded { id: charge }) => {
-                let r = sqlx::query(queries::ORDER_MARK_PAID).bind(&charge).bind(p.id).execute(self.pool()).await;
-                match r {
-                    Ok(done) if done.rows_affected() == 1 => Ok(p.id),
-                    // ほかの依頼が先に決着させた
-                    Ok(_) => self.load_order(customer_id, p.id).await.map(|o| o.id),
-                    Err(e) if duplicate_on(&e, "orders_payment") => Err(internal(
-                        "a charge is already used by another order",
-                        format!("{charge} for order {}", p.id),
-                    )),
-                    Err(e) => Err(db(e)),
+                if self.mark_paid(p.id, &charge).await? {
+                    Ok(p.id)
+                } else {
+                    // ほかの依頼か、突き合わせが先に決着させた
+                    self.load_order(customer_id, p.id).await.map(|o| o.id)
                 }
             }
             Ok(Charge::Declined { reason }) => {
@@ -370,6 +436,37 @@ impl ShopService {
             }
             Err(PaymentError::Invalid(e)) => Err(internal("payment refused the request", e)),
         }
+    }
+
+    /// 決着しないまま older_than 秒より古くなった pending の注文を、決済サービスの記録と突き合わせて片付ける。
+    /// - 決済が通っていれば paid にする（請求は済んでいる）。
+    /// - 拒否されていたか、決済の記録がなければ declined にして在庫を戻す（利用者は結果を受け取っていないので、
+    ///   新たに請求はしない）。
+    ///
+    /// 片付けた注文の数を返す。決済サービスに届かなければ、そこでやめる（次の回にやり直す）。
+    pub async fn reconcile(&self, older_than: u64) -> Result<usize, Status> {
+        let rows =
+            sqlx::query(queries::ORDERS_PENDING_STALE).bind(older_than).fetch_all(self.pool()).await.map_err(db)?;
+        let mut settled = 0;
+        for row in &rows {
+            let p = placed(row).map_err(db)?;
+            let found = match p.payment_key.as_deref() {
+                Some(key) => self.0.payment.find(key).await,
+                None => Ok(None),
+            };
+            match found {
+                Ok(Some(Charge::Succeeded { id: charge })) => {
+                    self.mark_paid(p.id, &charge).await?;
+                }
+                Ok(Some(Charge::Declined { .. }) | None) => self.decline(p.id).await?,
+                Err(e) => {
+                    eprintln!("proxy: cannot reconcile order {}: {e:?}", p.id);
+                    break;
+                }
+            }
+            settled += 1;
+        }
+        Ok(settled)
     }
 
     /// 注文する。
@@ -430,6 +527,10 @@ impl Shop for ShopService {
         if r.password.chars().count() > auth::MAX_PASSWORD {
             return Err(wrong());
         }
+        // 同じメールへの失敗が続いたら、しばらく照合しない（IP を替えながらの総当たりを遅くする）
+        if self.0.logins.exhausted(&email) {
+            return Err(too_many());
+        }
         let row =
             sqlx::query(queries::CREDENTIAL_BY_EMAIL).bind(&email).fetch_optional(self.pool()).await.map_err(db)?;
         let found = match &row {
@@ -442,8 +543,10 @@ impl Shop for ShopService {
         };
         let hash = found.as_ref().map(|(_, _, h)| h.clone());
         if !self.0.passwords.verify(r.password, hash).await.map_err(busy)? {
+            self.0.logins.count(&email);
             return Err(wrong());
         }
+        self.0.logins.forget(&email);
         let (customer_id, epoch, _) = found.ok_or_else(wrong)?;
         let c = self.customer(customer_id).await?;
         Ok(Response::new(self.session(Claim { customer_id, epoch }, c)))
@@ -453,6 +556,7 @@ impl Shop for ShopService {
         if let Some(claim) = self.0.sessions.verify(&request.into_inner().token, now()) {
             sqlx::query(queries::CUSTOMER_END_SESSIONS)
                 .bind(claim.customer_id)
+                .bind(claim.epoch)
                 .execute(self.pool())
                 .await
                 .map_err(db)?;
@@ -486,6 +590,9 @@ impl Shop for ShopService {
             return Err(invalid("card_token"));
         }
         let customer_id = self.authenticate(&r.token).await?;
+        if self.0.orders.hit(&customer_id.to_string()) {
+            return Err(too_many());
+        }
         // 呼んだ側が待つのをやめても（切断・時間切れ）、決済と決着は最後まで進める
         let this = self.clone();
         let id = tokio::spawn(async move { this.place(customer_id, &r).await })

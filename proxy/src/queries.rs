@@ -19,12 +19,14 @@ queries! {
     PRODUCTS_ALL = "products_all.sql";
     PRODUCT_LOCK = "product_lock.sql";
     PRODUCT_SET_STOCK = "product_set_stock.sql";
+    PRODUCT_LOCK_ORDER = "product_lock_order.sql";
     PRODUCT_RESTOCK_ORDER = "product_restock_order.sql";
     ORDER_BY_REQUEST = "order_by_request.sql";
     ORDER_INSERT = "order_insert.sql";
     ORDER_ITEM_INSERT = "order_item_insert.sql";
     ORDER_MARK_PAID = "order_mark_paid.sql";
     ORDER_MARK_DECLINED = "order_mark_declined.sql";
+    ORDERS_PENDING_STALE = "orders_pending_stale.sql";
     ORDER_BY_ID = "order_by_id.sql";
     ORDERS_BY_CUSTOMER = "orders_by_customer.sql";
     ORDER_ITEMS_BY_ORDER = "order_items_by_order.sql";
