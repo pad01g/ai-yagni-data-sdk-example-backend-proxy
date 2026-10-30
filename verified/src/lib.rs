@@ -3,6 +3,8 @@
 //! - `valid_quantity`: 1 行の数量は 1 以上 99 以下。
 //! - `reserve`: 在庫 stock から want を引き当てる。足りるときだけ残りを返す。
 //! - `order_total`: 明細の単価 × 数量の和。あふれるなら None。仕様 `line_sum` とちょうど一致する。
+//! - `session_is_fresh`: セッションは発行から ttl 秒のあいだだけ有効。未来の時刻に発行されたものは無効
+//!   （引き算があふれない形で書き、仕様とちょうど一致することを証明する）。
 // Verus の検証器が仕様を知っている形（比較の連なり、len、&Vec）で書くので、clippy の言い換えの提案は当てない。
 #![allow(clippy::manual_range_contains, clippy::len_zero, clippy::ptr_arg)]
 
@@ -24,6 +26,16 @@ pub fn reserve(stock: u32, want: u32) -> (r: Option<u32>)
         r is None <==> want > stock,
 {
     if want > stock { None } else { Some(stock - want) }
+}
+
+pub open spec fn fresh(issued_at: int, now: int, ttl: int) -> bool {
+    issued_at <= now && now - issued_at < ttl
+}
+
+pub fn session_is_fresh(issued_at: u64, now: u64, ttl: u64) -> (r: bool)
+    ensures r == fresh(issued_at as int, now as int, ttl as int),
+{
+    issued_at <= now && now - issued_at < ttl
 }
 
 /// 明細の単価 × 数量の和（先頭から）。
@@ -108,6 +120,15 @@ mod tests {
         assert!(valid_quantity(1) && valid_quantity(99) && !valid_quantity(0) && !valid_quantity(100));
         assert_eq!(reserve(3, 2), Some(1));
         assert_eq!(reserve(3, 4), None);
+    }
+
+    #[test]
+    fn sessions_expire_and_never_come_from_the_future() {
+        assert!(session_is_fresh(100, 100, 10));
+        assert!(session_is_fresh(100, 109, 10));
+        assert!(!session_is_fresh(100, 110, 10));
+        assert!(!session_is_fresh(101, 100, 10));
+        assert!(!session_is_fresh(0, u64::MAX, u64::MAX));
     }
 
     #[test]

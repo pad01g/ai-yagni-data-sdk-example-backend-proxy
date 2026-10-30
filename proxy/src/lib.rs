@@ -2,47 +2,84 @@
 //!
 //! djb 流の分割: backend-rust は DB にも決済サービスにも直接つながらず、`shop.v1.Shop` の操作だけを呼ぶ。
 //! proxy は SQL の文字列を受け取らず、`queries/*.sql` の固定クエリに値を束縛して投げるだけ。
-//! backend-rust が乗っ取られても、ここにない読み書き（ほかの表を読む、価格を書き換える、…）はできない。
+//!
+//! 顧客の認証も proxy がする（[`auth`]）。顧客を名指しする操作は、顧客 ID ではなく proxy が署名した
+//! セッションのトークンを受け取る。backend-rust が乗っ取られても、ログインしている顧客のデータにしか触れず、
+//! パスワードのハッシュも読めない。
 //!
 //! 注文の金額と在庫は proxy が DB の値から決める（Verus で証明した `proxy_verified` を使う）。
+//! 注文は 2 段で書く（[`ShopService::place`]）。決済サービスを待つあいだ、行の固定もトランザクションも持たない。
+pub mod auth;
 pub mod payment;
 pub mod queries;
 
 use std::collections::BTreeMap;
+use std::fmt::Display;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use shop_proxy_api::shop_server::Shop;
 use shop_proxy_api::{
-    CreateCustomerRequest, Credential, Customer, FindCredentialRequest, GetCustomerRequest, GetOrderRequest,
-    GetProductRequest, ListOrdersRequest, ListProductsRequest, Order, OrderItem, OrderList, PlaceOrderRequest, Product,
-    ProductList,
+    Customer, GetOrderRequest, ListOrdersRequest, ListProductsRequest, LogInRequest, LogOutRequest, LogOutResponse,
+    MeRequest, Order, OrderItem, OrderList, PlaceOrderRequest, Product, ProductList, Session, SignUpRequest,
 };
+use sqlx::Row;
 use sqlx::mysql::{MySqlDatabaseError, MySqlPool, MySqlRow};
-use sqlx::{MySql, Row, Transaction};
 use tonic::{Request, Response, Status};
 
-use crate::payment::{Charge, PaymentClient};
+use crate::auth::{Busy, Claim, Passwords, Sessions};
+use crate::payment::{Charge, PaymentClient, PaymentError, public_reason};
 
 /// 1 つの注文の明細の行数の上限。
 pub const MAX_LINES: usize = 20;
 /// 注文の通貨（今は円だけ）。
 pub const CURRENCY: &str = "JPY";
 
-pub struct ShopService {
+struct Inner {
     pool: MySqlPool,
     payment: PaymentClient,
+    sessions: Sessions,
+    passwords: Passwords,
 }
 
+#[derive(Clone)]
+pub struct ShopService(Arc<Inner>);
+
 impl ShopService {
-    pub fn new(pool: MySqlPool, payment: PaymentClient) -> Self {
-        Self { pool, payment }
+    pub fn new(pool: MySqlPool, payment: PaymentClient, sessions: Sessions, passwords: Passwords) -> Self {
+        Self(Arc::new(Inner { pool, payment, sessions, passwords }))
+    }
+
+    fn pool(&self) -> &MySqlPool {
+        &self.0.pool
     }
 }
 
-fn internal(e: sqlx::Error) -> Status {
-    Status::internal(format!("database: {e}"))
+fn now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
-/// MySQL のエラー番号（1062 = 一意キーの重複、1452 = 外部キーの相手がない）。
+// ---------------------------------------------------------------------------------------- 失敗
+
+/// 詳しいことはログにだけ書き、呼ぶ側には "internal" とだけ返す。
+fn internal(context: &str, e: impl Display) -> Status {
+    eprintln!("proxy: {context}: {e}");
+    Status::internal("internal")
+}
+
+fn invalid(field: &str) -> Status {
+    Status::invalid_argument(format!("invalid {field}"))
+}
+
+fn unauthenticated() -> Status {
+    Status::unauthenticated("unauthenticated")
+}
+
+fn busy(_: Busy) -> Status {
+    Status::unavailable("busy")
+}
+
+/// MySQL のエラー番号。
 fn mysql_error(e: &sqlx::Error) -> Option<u16> {
     match e {
         sqlx::Error::Database(d) => d.try_downcast_ref::<MySqlDatabaseError>().map(|m| m.number()),
@@ -50,13 +87,38 @@ fn mysql_error(e: &sqlx::Error) -> Option<u16> {
     }
 }
 
-fn check_len(name: &str, v: &str, min: usize, max: usize) -> Result<(), Status> {
+/// 一意キー key の重複か（1062 の文言にキーの名前が入る）。
+fn duplicate_on(e: &sqlx::Error, key: &str) -> bool {
+    mysql_error(e) == Some(1062) && e.to_string().contains(key)
+}
+
+/// DB の失敗。混んでいるだけ（行の固定の待ちの時間切れ、デッドロック、接続の空き待ち）ならやり直してよい。
+fn db(e: sqlx::Error) -> Status {
+    match (mysql_error(&e), &e) {
+        (Some(1205 | 1213), _) | (_, sqlx::Error::PoolTimedOut) => Status::unavailable("busy"),
+        _ => internal("database", e),
+    }
+}
+
+fn check_text(field: &str, v: &str, max: usize) -> Result<(), Status> {
     let n = v.chars().count();
-    if n < min || n > max {
-        return Err(Status::invalid_argument(format!("{name} must be {min}..={max} characters")));
+    if n == 0 || n > max || v.chars().any(char::is_control) {
+        return Err(invalid(field));
     }
     Ok(())
 }
+
+/// 依頼の冪等キー: 小文字の UUID の形（8-4-4-4-12 の 16 進）。大文字と小文字で別の依頼にならないように、
+/// 小文字だけを受け付ける。
+fn valid_request_key(k: &str) -> bool {
+    k.len() == 36
+        && k.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_digit() || (b'a'..=b'f').contains(&b),
+        })
+}
+
+// ---------------------------------------------------------------------------------------- 行
 
 /// 文字列の列。照合順序が *_bin の列は、sqlx に VARBINARY として報告されるので、バイト列からも読む。
 fn text(r: &MySqlRow, column: &str) -> Result<String, sqlx::Error> {
@@ -70,12 +132,7 @@ fn text(r: &MySqlRow, column: &str) -> Result<String, sqlx::Error> {
 }
 
 fn customer(r: &MySqlRow) -> Result<Customer, sqlx::Error> {
-    Ok(Customer {
-        id: r.try_get("id")?,
-        email: text(r, "email")?,
-        full_name: text(r, "full_name")?,
-        address: text(r, "address")?,
-    })
+    Ok(Customer { email: text(r, "email")?, full_name: text(r, "full_name")?, address: text(r, "address")? })
 }
 
 fn product(r: &MySqlRow) -> Result<Product, sqlx::Error> {
@@ -92,127 +149,162 @@ fn product(r: &MySqlRow) -> Result<Product, sqlx::Error> {
 fn order(r: &MySqlRow) -> Result<Order, sqlx::Error> {
     Ok(Order {
         id: r.try_get("id")?,
-        customer_id: r.try_get("customer_id")?,
         total: r.try_get("total")?,
         status: text(r, "status")?,
         created_at: text(r, "created_at")?,
-        payment_ref: text(r, "payment_ref")?,
         items: Vec::new(),
     })
 }
 
-fn item(r: &MySqlRow) -> Result<OrderItem, sqlx::Error> {
-    Ok(OrderItem {
+/// 明細と、その注文の ID。
+fn item(r: &MySqlRow) -> Result<(u64, OrderItem), sqlx::Error> {
+    let i = OrderItem {
         line_no: u32::from(r.try_get::<u16, _>("line_no")?),
         product_id: r.try_get("product_id")?,
         product_name: text(r, "product_name")?,
         quantity: r.try_get("quantity")?,
         unit_price: r.try_get("unit_price")?,
-    })
+    };
+    Ok((r.try_get("order_id")?, i))
 }
 
-/// 依頼の冪等キー: UUID の形（36 文字の 16 進と -）。
-fn valid_request_key(k: &str) -> bool {
-    k.len() == 36 && k.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+/// 書いた注文（決着の前かもしれない）。
+#[derive(Debug, Clone)]
+struct Placed {
+    id: u64,
+    total: u64,
+    status: String,
 }
+
+// ---------------------------------------------------------------------------------------- 操作の中身
 
 impl ShopService {
-    async fn load_order(&self, id: u64, customer_id: u64) -> Result<Order, Status> {
+    /// トークンを検証し、今の世代のセッションなら顧客 ID。
+    async fn authenticate(&self, token: &str) -> Result<u64, Status> {
+        let claim = self.0.sessions.verify(token, now()).ok_or_else(unauthenticated)?;
+        let row = sqlx::query(queries::CUSTOMER_SESSION)
+            .bind(claim.customer_id)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(db)?
+            .ok_or_else(unauthenticated)?;
+        let epoch: u32 = row.try_get("session_epoch").map_err(db)?;
+        if epoch != claim.epoch {
+            return Err(unauthenticated());
+        }
+        Ok(claim.customer_id)
+    }
+
+    async fn customer(&self, id: u64) -> Result<Customer, Status> {
+        let row = sqlx::query(queries::CUSTOMER_BY_ID)
+            .bind(id)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(db)?
+            .ok_or_else(unauthenticated)?;
+        customer(&row).map_err(db)
+    }
+
+    fn session(&self, claim: Claim, customer: Customer) -> Session {
+        Session { token: self.0.sessions.issue(claim, now()), max_age: self.0.sessions.ttl, customer: Some(customer) }
+    }
+
+    async fn load_order(&self, customer_id: u64, id: u64) -> Result<Order, Status> {
         let row = sqlx::query(queries::ORDER_BY_ID)
             .bind(id)
             .bind(customer_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(self.pool())
             .await
-            .map_err(internal)?
+            .map_err(db)?
             .ok_or_else(|| Status::not_found("no such order"))?;
-        let mut o = order(&row).map_err(internal)?;
-        o.items = self.items(o.id).await?;
+        let mut o = order(&row).map_err(db)?;
+        let rows = sqlx::query(queries::ORDER_ITEMS_BY_ORDER).bind(id).fetch_all(self.pool()).await.map_err(db)?;
+        o.items = rows.iter().map(|r| item(r).map(|(_, i)| i)).collect::<Result<_, _>>().map_err(db)?;
         Ok(o)
     }
 
-    async fn items(&self, order_id: u64) -> Result<Vec<OrderItem>, Status> {
-        let rows =
-            sqlx::query(queries::ORDER_ITEMS_BY_ORDER).bind(order_id).fetch_all(&self.pool).await.map_err(internal)?;
-        rows.iter().map(item).collect::<Result<_, _>>().map_err(internal)
-    }
-
-    async fn existing_order(
-        tx: &mut Transaction<'_, MySql>,
-        customer_id: u64,
-        key: &str,
-    ) -> Result<Option<u64>, Status> {
-        let row = sqlx::query(queries::ORDER_BY_REQUEST)
+    /// 同じ依頼の注文が既にあれば返す。同じキーで明細が違えば ALREADY_EXISTS（前の注文を黙って返さない）。
+    async fn existing(&self, customer_id: u64, req: &PlaceOrderRequest) -> Result<Option<Placed>, Status> {
+        let Some(row) = sqlx::query(queries::ORDER_BY_REQUEST)
             .bind(customer_id)
-            .bind(key)
-            .fetch_optional(&mut **tx)
+            .bind(&req.request_key)
+            .fetch_optional(self.pool())
             .await
-            .map_err(internal)?;
-        row.map(|r| r.try_get::<u64, _>("id")).transpose().map_err(internal)
+            .map_err(db)?
+        else {
+            return Ok(None);
+        };
+        let placed = Placed {
+            id: row.try_get("id").map_err(db)?,
+            total: row.try_get("total").map_err(db)?,
+            status: text(&row, "status").map_err(db)?,
+        };
+        let rows =
+            sqlx::query(queries::ORDER_ITEMS_BY_ORDER).bind(placed.id).fetch_all(self.pool()).await.map_err(db)?;
+        let mut before = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let (_, i) = item(r).map_err(db)?;
+            before.push((i.product_id, i.quantity));
+        }
+        let now: Vec<(u64, u32)> = req.lines.iter().map(|l| (l.product_id, l.quantity)).collect();
+        if before != now {
+            return Err(Status::already_exists("request_key reused"));
+        }
+        Ok(Some(placed))
     }
 
-    /// 注文の本体。成功したら注文の ID を返す。
-    async fn place(&self, req: &PlaceOrderRequest) -> Result<u64, Status> {
-        let mut tx = self.pool.begin().await.map_err(internal)?;
-        if let Some(id) = Self::existing_order(&mut tx, req.customer_id, &req.request_key).await? {
-            return Ok(id);
-        }
-        // 行を固定する順序をそろえる（デッドロックを避ける）
+    /// 1 つ目のトランザクション: 商品の行を固定し、在庫を引き当て、DB の価格で合計を決め、注文を pending で書く。
+    async fn reserve(&self, customer_id: u64, req: &PlaceOrderRequest) -> Result<Placed, Status> {
+        // 同じ商品の明細は足し合わせて引き当てる。行を固定する順序をそろえる（デッドロックを避ける）
         let mut wanted: BTreeMap<u64, u32> = BTreeMap::new();
         for l in &req.lines {
             let w = wanted.entry(l.product_id).or_insert(0);
-            *w = w.checked_add(l.quantity).ok_or_else(|| Status::invalid_argument("quantity too large"))?;
+            *w = w.checked_add(l.quantity).ok_or_else(|| invalid("quantity"))?;
         }
+        if wanted.values().any(|&w| !proxy_verified::valid_quantity(w)) {
+            return Err(invalid("quantity"));
+        }
+        let mut tx = self.pool().begin().await.map_err(db)?;
         let mut prices: BTreeMap<u64, u32> = BTreeMap::new();
+        let mut stocks: Vec<(u64, u32, u32)> = Vec::new();
         for (&id, &want) in &wanted {
             let row = sqlx::query(queries::PRODUCT_LOCK)
                 .bind(id)
                 .fetch_optional(&mut *tx)
                 .await
-                .map_err(internal)?
-                .ok_or_else(|| Status::not_found(format!("no product {id}")))?;
-            let name = text(&row, "name").map_err(internal)?;
-            let stock: i32 = row.try_get("stock").map_err(internal)?;
-            if proxy_verified::reserve(u32::try_from(stock).unwrap_or(0), want).is_none() {
+                .map_err(db)?
+                .ok_or_else(|| invalid("product_id"))?;
+            let stock: i32 = row.try_get("stock").map_err(db)?;
+            let stock = u32::try_from(stock).map_err(|_| internal("negative stock", id))?;
+            let Some(left) = proxy_verified::reserve(stock, want) else {
+                let name = text(&row, "name").map_err(db)?;
                 return Err(Status::failed_precondition(format!("out of stock: {name}")));
-            }
-            prices.insert(id, row.try_get("price").map_err(internal)?);
+            };
+            stocks.push((id, stock, left));
+            prices.insert(id, row.try_get("price").map_err(db)?);
         }
         let line_prices: Vec<u32> = req.lines.iter().map(|l| prices[&l.product_id]).collect();
         let quantities: Vec<u32> = req.lines.iter().map(|l| l.quantity).collect();
-        let total = proxy_verified::order_total(&line_prices, &quantities)
-            .ok_or_else(|| Status::invalid_argument("total too large"))?;
-
-        let key = format!("order-{}-{}", req.customer_id, req.request_key);
-        let payment_ref = match self.payment.charge(&key, total, CURRENCY, &req.card_token).await {
-            Ok(Charge::Succeeded { id }) => id,
-            Ok(Charge::Declined { reason }) => {
-                return Err(Status::failed_precondition(format!("payment declined: {reason}")));
-            }
-            Err(e) => return Err(Status::unavailable(e)),
-        };
+        let total = proxy_verified::order_total(&line_prices, &quantities).ok_or_else(|| invalid("quantity"))?;
 
         let inserted = sqlx::query(queries::ORDER_INSERT)
-            .bind(req.customer_id)
+            .bind(customer_id)
             .bind(&req.request_key)
             .bind(total)
-            .bind(&payment_ref)
             .execute(&mut *tx)
             .await;
         let order_id = match inserted {
             Ok(r) => r.last_insert_id(),
-            Err(e) if mysql_error(&e) == Some(1452) => return Err(Status::not_found("no such customer")),
-            Err(e) if mysql_error(&e) == Some(1062) => {
-                // 同じ依頼が同時に来た。先に書いた方の注文を返す
+            Err(e) if duplicate_on(&e, "orders_request") => {
+                // 同じ依頼が同時に来て、先に書いた方がある
                 drop(tx);
-                let mut tx = self.pool.begin().await.map_err(internal)?;
-                return Self::existing_order(&mut tx, req.customer_id, &req.request_key)
-                    .await?
-                    .ok_or_else(|| Status::aborted("concurrent order"));
+                return self.existing(customer_id, req).await?.ok_or_else(|| Status::unavailable("busy"));
             }
-            Err(e) => return Err(internal(e)),
+            Err(e) if mysql_error(&e) == Some(1452) => return Err(unauthenticated()),
+            Err(e) => return Err(db(e)),
         };
         for (i, (l, price)) in req.lines.iter().zip(&line_prices).enumerate() {
-            let line_no = u16::try_from(i + 1).map_err(|_| Status::invalid_argument("too many lines"))?;
+            let line_no = u16::try_from(i + 1).map_err(|_| invalid("lines"))?;
             sqlx::query(queries::ORDER_ITEM_INSERT)
                 .bind(order_id)
                 .bind(line_no)
@@ -221,131 +313,243 @@ impl ShopService {
                 .bind(price)
                 .execute(&mut *tx)
                 .await
-                .map_err(internal)?;
+                .map_err(db)?;
         }
-        for (&id, &want) in &wanted {
-            let r = sqlx::query(queries::PRODUCT_TAKE_STOCK)
-                .bind(want)
+        for (id, stock, left) in stocks {
+            let r = sqlx::query(queries::PRODUCT_SET_STOCK)
+                .bind(left)
                 .bind(id)
-                .bind(want)
+                .bind(stock)
                 .execute(&mut *tx)
                 .await
-                .map_err(internal)?;
+                .map_err(db)?;
             if r.rows_affected() != 1 {
-                return Err(Status::aborted("stock changed"));
+                return Err(internal("stock changed under the row lock", id));
             }
         }
-        tx.commit().await.map_err(internal)?;
-        Ok(order_id)
+        tx.commit().await.map_err(db)?;
+        Ok(Placed { id: order_id, total, status: "pending".to_owned() })
+    }
+
+    /// 決済の拒否: 注文を declined にし、引き当てた在庫を戻す（1 つのトランザクション）。
+    async fn decline(&self, order_id: u64) -> Result<(), Status> {
+        let mut tx = self.pool().begin().await.map_err(db)?;
+        let r = sqlx::query(queries::ORDER_MARK_DECLINED).bind(order_id).execute(&mut *tx).await.map_err(db)?;
+        if r.rows_affected() == 1 {
+            sqlx::query(queries::PRODUCT_RESTOCK_ORDER).bind(order_id).execute(&mut *tx).await.map_err(db)?;
+        }
+        tx.commit().await.map_err(db)
+    }
+
+    /// pending の注文を、決済サービスに請求して決着させる。トランザクションの外で請求する。
+    /// 冪等キーは注文の ID なので、やり直しても二重に請求しない。
+    async fn settle(&self, customer_id: u64, p: &Placed, card_token: &str) -> Result<u64, Status> {
+        let key = format!("order-{}", p.id);
+        match self.0.payment.charge(&key, p.total, CURRENCY, card_token).await {
+            Ok(Charge::Succeeded { id: charge }) => {
+                let r = sqlx::query(queries::ORDER_MARK_PAID).bind(&charge).bind(p.id).execute(self.pool()).await;
+                match r {
+                    Ok(done) if done.rows_affected() == 1 => Ok(p.id),
+                    // ほかの依頼が先に決着させた
+                    Ok(_) => self.load_order(customer_id, p.id).await.map(|o| o.id),
+                    Err(e) if duplicate_on(&e, "orders_payment") => Err(internal(
+                        "a charge is already used by another order",
+                        format!("{charge} for order {}", p.id),
+                    )),
+                    Err(e) => Err(db(e)),
+                }
+            }
+            Ok(Charge::Declined { reason }) => {
+                self.decline(p.id).await?;
+                Err(Status::failed_precondition(format!("payment declined: {}", public_reason(&reason))))
+            }
+            Err(PaymentError::Conflict) => Err(Status::failed_precondition("payment conflict")),
+            Err(PaymentError::Unavailable(e)) => {
+                eprintln!("proxy: payment unavailable for order {}: {e}", p.id);
+                Err(Status::unavailable("payment unavailable"))
+            }
+            Err(PaymentError::Invalid(e)) => Err(internal("payment refused the request", e)),
+        }
+    }
+
+    /// 注文する。
+    /// 1. 同じ依頼の注文があればそれを使う。なければ在庫を引き当てて pending で書く（[`Self::reserve`]）。
+    /// 2. pending なら決済サービスに請求し、paid か declined に決着させる（[`Self::settle`]）。
+    ///
+    /// 決済サービスに届かなければ注文は pending のまま残り、引き当てた在庫も残る。同じ依頼をやり直すと決着する。
+    async fn place(&self, customer_id: u64, req: &PlaceOrderRequest) -> Result<u64, Status> {
+        let placed = match self.existing(customer_id, req).await? {
+            Some(p) => p,
+            None => self.reserve(customer_id, req).await?,
+        };
+        match placed.status.as_str() {
+            "pending" => self.settle(customer_id, &placed, &req.card_token).await,
+            "declined" => Err(Status::failed_precondition("payment declined: declined")),
+            _ => Ok(placed.id),
+        }
     }
 }
 
+// ---------------------------------------------------------------------------------------- gRPC
+
 #[tonic::async_trait]
 impl Shop for ShopService {
-    async fn create_customer(&self, request: Request<CreateCustomerRequest>) -> Result<Response<Customer>, Status> {
+    async fn sign_up(&self, request: Request<SignUpRequest>) -> Result<Response<Session>, Status> {
         let r = request.into_inner();
-        check_len("email", &r.email, 3, 254)?;
-        if !r.email.contains('@') {
-            return Err(Status::invalid_argument("email must contain @"));
+        let email = auth::normalize_email(&r.email).ok_or_else(|| invalid("email"))?;
+        let n = r.password.chars().count();
+        if !(auth::MIN_PASSWORD..=auth::MAX_PASSWORD).contains(&n) {
+            return Err(invalid("password"));
         }
-        check_len("password_hash", &r.password_hash, 1, 255)?;
-        check_len("full_name", &r.full_name, 1, 100)?;
-        check_len("address", &r.address, 1, 500)?;
+        let (full_name, address) = (r.full_name.trim(), r.address.trim());
+        check_text("full_name", full_name, 100)?;
+        check_text("address", address, 500)?;
+        let password_hash = self.0.passwords.hash(r.password).await.map_err(busy)?;
         let res = sqlx::query(queries::CUSTOMER_INSERT)
-            .bind(&r.email)
-            .bind(&r.password_hash)
-            .bind(&r.full_name)
-            .bind(&r.address)
-            .execute(&self.pool)
-            .await;
-        match res {
-            Ok(done) => Ok(Response::new(Customer {
-                id: done.last_insert_id(),
-                email: r.email,
-                full_name: r.full_name,
-                address: r.address,
-            })),
-            Err(e) if mysql_error(&e) == Some(1062) => Err(Status::already_exists("the email is already registered")),
-            Err(e) => Err(internal(e)),
-        }
-    }
-
-    async fn get_customer(&self, request: Request<GetCustomerRequest>) -> Result<Response<Customer>, Status> {
-        let id = request.into_inner().id;
-        let row = sqlx::query(queries::CUSTOMER_BY_ID)
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| Status::not_found("no such customer"))?;
-        Ok(Response::new(customer(&row).map_err(internal)?))
-    }
-
-    async fn find_credential(&self, request: Request<FindCredentialRequest>) -> Result<Response<Credential>, Status> {
-        let email = request.into_inner().email;
-        let row = sqlx::query(queries::CREDENTIAL_BY_EMAIL)
             .bind(&email)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| Status::not_found("no such customer"))?;
-        Ok(Response::new(Credential {
-            customer_id: row.try_get("id").map_err(internal)?,
-            password_hash: text(&row, "password_hash").map_err(internal)?,
-        }))
+            .bind(&password_hash)
+            .bind(full_name)
+            .bind(address)
+            .execute(self.pool())
+            .await;
+        let id = match res {
+            Ok(done) => done.last_insert_id(),
+            Err(e) if duplicate_on(&e, "customers_email") => return Err(Status::already_exists("email taken")),
+            Err(e) if mysql_error(&e) == Some(3819) => return Err(invalid("email")),
+            Err(e) => return Err(db(e)),
+        };
+        let c = Customer { email, full_name: full_name.to_owned(), address: address.to_owned() };
+        Ok(Response::new(self.session(Claim { customer_id: id, epoch: 0 }, c)))
+    }
+
+    async fn log_in(&self, request: Request<LogInRequest>) -> Result<Response<Session>, Status> {
+        let r = request.into_inner();
+        let wrong = || Status::unauthenticated("wrong credentials");
+        // 形の誤りと長すぎるパスワードは、照合せずに断る（重い計算をさせない）
+        let email = auth::normalize_email(&r.email).ok_or_else(wrong)?;
+        if r.password.chars().count() > auth::MAX_PASSWORD {
+            return Err(wrong());
+        }
+        let row =
+            sqlx::query(queries::CREDENTIAL_BY_EMAIL).bind(&email).fetch_optional(self.pool()).await.map_err(db)?;
+        let found = match &row {
+            Some(row) => Some((
+                row.try_get::<u64, _>("id").map_err(db)?,
+                row.try_get::<u32, _>("session_epoch").map_err(db)?,
+                text(row, "password_hash").map_err(db)?,
+            )),
+            None => None,
+        };
+        let hash = found.as_ref().map(|(_, _, h)| h.clone());
+        if !self.0.passwords.verify(r.password, hash).await.map_err(busy)? {
+            return Err(wrong());
+        }
+        let (customer_id, epoch, _) = found.ok_or_else(wrong)?;
+        let c = self.customer(customer_id).await?;
+        Ok(Response::new(self.session(Claim { customer_id, epoch }, c)))
+    }
+
+    async fn log_out(&self, request: Request<LogOutRequest>) -> Result<Response<LogOutResponse>, Status> {
+        if let Some(claim) = self.0.sessions.verify(&request.into_inner().token, now()) {
+            sqlx::query(queries::CUSTOMER_END_SESSIONS)
+                .bind(claim.customer_id)
+                .execute(self.pool())
+                .await
+                .map_err(db)?;
+        }
+        Ok(Response::new(LogOutResponse {}))
+    }
+
+    async fn me(&self, request: Request<MeRequest>) -> Result<Response<Customer>, Status> {
+        let id = self.authenticate(&request.into_inner().token).await?;
+        Ok(Response::new(self.customer(id).await?))
     }
 
     async fn list_products(&self, _: Request<ListProductsRequest>) -> Result<Response<ProductList>, Status> {
-        let rows = sqlx::query(queries::PRODUCTS_ALL).fetch_all(&self.pool).await.map_err(internal)?;
-        let products = rows.iter().map(product).collect::<Result<_, _>>().map_err(internal)?;
+        let rows = sqlx::query(queries::PRODUCTS_ALL).fetch_all(self.pool()).await.map_err(db)?;
+        let products = rows.iter().map(product).collect::<Result<_, _>>().map_err(db)?;
         Ok(Response::new(ProductList { products }))
-    }
-
-    async fn get_product(&self, request: Request<GetProductRequest>) -> Result<Response<Product>, Status> {
-        let row = sqlx::query(queries::PRODUCT_BY_ID)
-            .bind(request.into_inner().id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| Status::not_found("no such product"))?;
-        Ok(Response::new(product(&row).map_err(internal)?))
     }
 
     async fn place_order(&self, request: Request<PlaceOrderRequest>) -> Result<Response<Order>, Status> {
         let r = request.into_inner();
         if !valid_request_key(&r.request_key) {
-            return Err(Status::invalid_argument("request_key must be a UUID"));
+            return Err(invalid("request_key"));
         }
         if r.lines.is_empty() || r.lines.len() > MAX_LINES {
-            return Err(Status::invalid_argument(format!("an order has 1..={MAX_LINES} lines")));
+            return Err(invalid("lines"));
         }
-        if let Some(l) = r.lines.iter().find(|l| !proxy_verified::valid_quantity(l.quantity)) {
-            return Err(Status::invalid_argument(format!(
-                "quantity must be 1..={} (got {})",
-                proxy_verified::MAX_QUANTITY,
-                l.quantity
-            )));
+        if r.lines.iter().any(|l| !proxy_verified::valid_quantity(l.quantity)) {
+            return Err(invalid("quantity"));
         }
-        check_len("card_token", &r.card_token, 1, 64)?;
-        let id = self.place(&r).await?;
-        Ok(Response::new(self.load_order(id, r.customer_id).await?))
+        if r.card_token.is_empty() || r.card_token.len() > 64 {
+            return Err(invalid("card_token"));
+        }
+        let customer_id = self.authenticate(&r.token).await?;
+        // 呼んだ側が待つのをやめても（切断・時間切れ）、決済と決着は最後まで進める
+        let this = self.clone();
+        let id = tokio::spawn(async move { this.place(customer_id, &r).await })
+            .await
+            .map_err(|e| internal("the order task failed", e))??;
+        Ok(Response::new(self.load_order(customer_id, id).await?))
     }
 
     async fn list_orders(&self, request: Request<ListOrdersRequest>) -> Result<Response<OrderList>, Status> {
-        let customer_id = request.into_inner().customer_id;
-        let rows =
-            sqlx::query(queries::ORDERS_BY_CUSTOMER).bind(customer_id).fetch_all(&self.pool).await.map_err(internal)?;
-        let mut orders = Vec::with_capacity(rows.len());
-        for r in &rows {
-            let mut o = order(r).map_err(internal)?;
-            o.items = self.items(o.id).await?;
-            orders.push(o);
+        let customer_id = self.authenticate(&request.into_inner().token).await?;
+        // 注文と明細を同じスナップショットから読む
+        let mut tx = self.pool().begin().await.map_err(db)?;
+        let rows = sqlx::query(queries::ORDERS_BY_CUSTOMER).bind(customer_id).fetch_all(&mut *tx).await.map_err(db)?;
+        let mut orders: Vec<Order> = rows.iter().map(order).collect::<Result<_, _>>().map_err(db)?;
+        if let Some(oldest) = orders.iter().map(|o| o.id).min() {
+            let rows = sqlx::query(queries::ORDER_ITEMS_BY_CUSTOMER)
+                .bind(customer_id)
+                .bind(oldest)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(db)?;
+            let mut items: BTreeMap<u64, Vec<OrderItem>> = BTreeMap::new();
+            for r in &rows {
+                let (order_id, i) = item(r).map_err(db)?;
+                items.entry(order_id).or_default().push(i);
+            }
+            for o in &mut orders {
+                o.items = items.remove(&o.id).unwrap_or_default();
+            }
         }
+        tx.commit().await.map_err(db)?;
         Ok(Response::new(OrderList { orders }))
     }
 
     async fn get_order(&self, request: Request<GetOrderRequest>) -> Result<Response<Order>, Status> {
         let r = request.into_inner();
-        Ok(Response::new(self.load_order(r.order_id, r.customer_id).await?))
+        let customer_id = self.authenticate(&r.token).await?;
+        Ok(Response::new(self.load_order(customer_id, r.order_id).await?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_keys_are_lower_case_uuids() {
+        assert!(valid_request_key("6f1c2a0e-0b6f-4c55-9d43-0d8a3c1e0001"));
+        assert!(!valid_request_key("6F1C2A0E-0B6F-4C55-9D43-0D8A3C1E0001"));
+        assert!(!valid_request_key("------------------------------------"));
+        assert!(!valid_request_key("6f1c2a0e0b6f-4c55-9d43-0d8a3c1e0001-"));
+    }
+
+    #[test]
+    fn every_query_file_is_embedded() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../queries");
+        let mut files: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(".sql"))
+            .collect();
+        files.sort();
+        let mut embedded: Vec<String> = queries::ALL.iter().map(|(f, _)| (*f).to_owned()).collect();
+        embedded.sort();
+        assert_eq!(files, embedded);
     }
 }

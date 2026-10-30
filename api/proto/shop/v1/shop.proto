@@ -1,62 +1,81 @@
 // backend-proxy が受け付ける操作の全部。
 //
-// backend-rust はデータベースに直接つながらず、この操作だけを呼ぶ。どの操作も、proxy の中の固定クエリ
-// （queries/*.sql）だけを使う。SQL の文字列や、表・列の名前を受け取る操作はない。
-// backend-rust が乗っ取られても、ここにない読み書きはできない。
+// backend-rust はデータベースにも決済サービスにも直接つながらず、この操作だけを呼ぶ。どの操作も、proxy の中の
+// 固定クエリ（queries/*.sql）だけを使う。SQL の文字列や、表・列の名前を受け取る操作はない。
+//
+// 顧客を名指しする操作は、顧客 ID ではなく proxy が発行したセッションのトークンを受け取る。トークンの署名の鍵は
+// proxy だけが持つ。そのため backend-rust が乗っ取られても、ログインした顧客のデータにしか触れない
+// （ほかの顧客の個人情報や注文を読む、ほかの顧客として注文する、パスワードのハッシュを読む、はできない）。
+//
+// 失敗は gRPC の状態で返す。メッセージは決まった短い英語で、利用者向けの言葉にするのは backend-rust の仕事:
+//   INVALID_ARGUMENT    "invalid <field>"
+//   UNAUTHENTICATED     "unauthenticated"（トークンが無効・期限切れ・ログアウト済み）、"wrong credentials"
+//   ALREADY_EXISTS      "email taken"、"request_key reused"（同じキーで違う中身の注文）
+//   FAILED_PRECONDITION "out of stock: <商品名>"、"payment declined: <理由>"、"payment conflict"
+//   NOT_FOUND           "no such order"
+//   UNAVAILABLE         "busy"、"payment unavailable"（同じ依頼をやり直してよい）
+//   INTERNAL            "internal"（詳しいことは proxy のログにだけ書く）
 syntax = "proto3";
 
 package shop.v1;
 
 service Shop {
-  // 顧客を登録する。メールが使われていれば ALREADY_EXISTS。
-  rpc CreateCustomer(CreateCustomerRequest) returns (Customer);
-  rpc GetCustomer(GetCustomerRequest) returns (Customer);
-  // ログインのための照合材料（パスワードのハッシュ）。照合は backend-rust がする。なければ NOT_FOUND。
-  rpc FindCredential(FindCredentialRequest) returns (Credential);
+  // 登録してセッションを始める。メールは小文字にそろえる。
+  rpc SignUp(SignUpRequest) returns (Session);
+  // メールとパスワードを照合してセッションを始める。登録がないときも "wrong credentials"（区別しない）。
+  rpc LogIn(LogInRequest) returns (Session);
+  // その顧客のセッションを、ほかの端末のものも含めてすべて終える。トークンが無効でも成功する。
+  rpc LogOut(LogOutRequest) returns (LogOutResponse);
+  rpc Me(MeRequest) returns (Customer);
 
   rpc ListProducts(ListProductsRequest) returns (ProductList);
-  rpc GetProduct(GetProductRequest) returns (Product);
 
-  // 注文する。在庫を引き当て、決済サービスに請求し、注文を書く（1 つのトランザクション）。
-  // 同じ (customer_id, request_key) には同じ注文を返す。在庫不足と決済の拒否は FAILED_PRECONDITION。
+  // 注文する。在庫を引き当てて注文を pending で書き（1 つ目のトランザクション）、決済サービスに請求し、
+  // 結果で paid か declined に決着させる。同じ (顧客, request_key) には同じ注文を返す。
+  // 決済サービスに届かなければ UNAVAILABLE で、注文は pending のまま残る。同じ依頼をやり直すと決着する。
   rpc PlaceOrder(PlaceOrderRequest) returns (Order);
+  // 新しい注文から 100 件（決済が拒否された注文は含めない）。
   rpc ListOrders(ListOrdersRequest) returns (OrderList);
-  // 顧客自身の注文だけを返す。なければ NOT_FOUND。
   rpc GetOrder(GetOrderRequest) returns (Order);
 }
 
-message CreateCustomerRequest {
+message SignUpRequest {
   string email = 1;
-  string password_hash = 2;
+  string password = 2;
   string full_name = 3;
   string address = 4;
 }
 
-message GetCustomerRequest {
-  uint64 id = 1;
+message LogInRequest {
+  string email = 1;
+  string password = 2;
+}
+
+message Session {
+  // backend-rust は中身を解釈せず、cookie に入れて次の依頼で返す。
+  string token = 1;
+  // 有効な秒数
+  uint64 max_age = 2;
+  Customer customer = 3;
+}
+
+message LogOutRequest {
+  string token = 1;
+}
+
+message LogOutResponse {}
+
+message MeRequest {
+  string token = 1;
 }
 
 message Customer {
-  uint64 id = 1;
-  string email = 2;
-  string full_name = 3;
-  string address = 4;
-}
-
-message FindCredentialRequest {
   string email = 1;
-}
-
-message Credential {
-  uint64 customer_id = 1;
-  string password_hash = 2;
+  string full_name = 2;
+  string address = 3;
 }
 
 message ListProductsRequest {}
-
-message GetProductRequest {
-  uint64 id = 1;
-}
 
 message Product {
   uint64 id = 1;
@@ -78,8 +97,8 @@ message OrderLine {
 }
 
 message PlaceOrderRequest {
-  uint64 customer_id = 1;
-  // 依頼の冪等キー（UUID の文字列）
+  string token = 1;
+  // 依頼の冪等キー（小文字の UUID）
   string request_key = 2;
   repeated OrderLine lines = 3;
   // 決済サービスのカードのトークン
@@ -96,17 +115,16 @@ message OrderItem {
 
 message Order {
   uint64 id = 1;
-  uint64 customer_id = 2;
-  uint64 total = 3;
-  string status = 4;
+  uint64 total = 2;
+  // pending, paid, shipped, cancelled
+  string status = 3;
   // UTC（YYYY-MM-DD HH:MM:SS.ffffff）
-  string created_at = 5;
-  string payment_ref = 6;
-  repeated OrderItem items = 7;
+  string created_at = 4;
+  repeated OrderItem items = 5;
 }
 
 message ListOrdersRequest {
-  uint64 customer_id = 1;
+  string token = 1;
 }
 
 message OrderList {
@@ -114,6 +132,6 @@ message OrderList {
 }
 
 message GetOrderRequest {
-  uint64 customer_id = 1;
+  string token = 1;
   uint64 order_id = 2;
 }

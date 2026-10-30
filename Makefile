@@ -2,9 +2,8 @@
 DEV      := ai-yagni-data-rust-dev
 VERUS    := ai-yagni-data-verus
 NAME     := ai-yagni-data-sdk-example-backend-proxy
-SOCK     := -v /var/run/docker.sock:/var/run/docker.sock
 CACHE    := -v ai-yagni-data-cargo:/usr/local/cargo/registry -v ai-yagni-data-cargo-git:/usr/local/cargo/git -v $(NAME)-target:/work/target
-RUN      := docker run --rm $(SOCK) $(CACHE) -v $(CURDIR):/work -w /work $(DEV)
+RUN      := docker run --rm $(CACHE) -v $(CURDIR):/work -w /work $(DEV)
 
 .DEFAULT_GOAL := help
 .PHONY: help image verus-image build test lint fmt verify ci sh
@@ -24,14 +23,15 @@ build: image ## ビルド
 NET      := $(NAME)-test
 TESTDB   := $(NAME)-mysql
 
-test: image ## テスト（MySQL のコンテナを試験用のスキーマで立てる）
+test: image ## テスト（MySQL のコンテナを試験用のスキーマと grants.sql の権限で立て、proxy のユーザーでつなぐ）
 	docker network create $(NET) >/dev/null 2>&1 || true
 	docker rm -f $(TESTDB) >/dev/null 2>&1 || true
 	docker run -d --rm --name $(TESTDB) --network $(NET) --tmpfs /var/lib/mysql \
 	  -e MYSQL_ROOT_PASSWORD=test -e MYSQL_DATABASE=shop -v $(CURDIR)/testdata:/docker-entrypoint-initdb.d:ro \
+	  -v $(CURDIR)/grants.sql:/grants.sql:ro \
 	  mysql:8.4.6 --character-set-server=utf8mb4 --collation-server=utf8mb4_0900_bin >/dev/null
 	docker run --rm $(CACHE) -v $(CURDIR):/work -w /work --network $(NET) \
-	  -e DATABASE_URL=mysql://root:test@$(TESTDB):3306/shop $(DEV) cargo test --locked; \
+	  -e DATABASE_URL=mysql://proxy:test@$(TESTDB):3306/shop $(DEV) cargo test --locked; \
 	  s=$$?; docker rm -f $(TESTDB) >/dev/null; docker network rm $(NET) >/dev/null; exit $$s
 
 lint: image ## clippy と rustfmt
@@ -47,5 +47,5 @@ verify: verus-image ## Verus で証明を確かめる（verified/）
 ci: lint test verify ## CI で走らせるもの全部
 
 sh: image ## 開発用のシェル
-	docker run --rm -it $(SOCK) $(CACHE) -v $(CURDIR):/work -w /work $(DEV) bash
+	docker run --rm -it $(CACHE) -v $(CURDIR):/work -w /work $(DEV) bash
 

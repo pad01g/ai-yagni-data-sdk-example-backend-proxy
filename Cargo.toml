@@ -3,7 +3,7 @@ resolver = "3"
 members = ["api", "proxy", "verified"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
@@ -17,3 +17,10 @@ tonic-prost = "0.14"
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_only)', 'cfg(verus_keep_ghost)'] }
+
+# argon2 は最適化しないと遅い（テストで何度もハッシュを計算する）
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
